@@ -132,27 +132,63 @@ start_power_monitor_alt() {
             cpu_freq=$(sysctl -n hw.cpufrequency 2>/dev/null | awk '{printf "%.0f", $1/1000000}' || echo "2600")
             load_avg=$(uptime | awk -F'load averages:' '{print $2}' | awk '{print $1}' | sed 's/,//' || echo "0")
 
-            # Enhanced power estimation algorithm
-            if [ "$cpu_freq" -ge 2500 ] && (( $(echo "$load_avg > 5.0" | bc -l 2>/dev/null || echo 0) )); then
-                # High performance mode
-                base_power=15
-                load_factor=$(echo "scale=1; ($load_avg - 5) * 2.5" | bc -l 2>/dev/null || echo "0")
-                cpu_pkg_power=$(echo "scale=1; $base_power + $load_factor" | bc -l 2>/dev/null || echo "15")
-            elif [ "$cpu_freq" -ge 2000 ]; then
-                # Normal mode
-                base_power=8
-                load_factor=$(echo "scale=1; $load_avg * 1.2" | bc -l 2>/dev/null || echo "0")
-                cpu_pkg_power=$(echo "scale=1; $base_power + $load_factor" | bc -l 2>/dev/null || echo "8")
-            elif [ "$cpu_freq" -ge 1500 ]; then
-                # Power save mode
-                base_power=5
-                load_factor=$(echo "scale=1; $load_avg * 0.8" | bc -l 2>/dev/null || echo "0")
-                cpu_pkg_power=$(echo "scale=1; $base_power + $load_factor" | bc -l 2>/dev/null || echo "5")
+            # Corrected power estimation algorithm based on Intel i7-9750H specs
+            # Intel i7-9750H: TDP 45W, Max ~60-70W, Base 2.6GHz, Turbo 4.5GHz
+
+            # Base power consumption at different frequencies (based on Intel specs)
+            if [ "$cpu_freq" -ge 4500 ]; then
+                # Max turbo frequency - highest power
+                base_power=60
+            elif [ "$cpu_freq" -ge 4000 ]; then
+                # High turbo - interpolate between 3.5GHz and 4.5GHz
+                base_power=$(echo "scale=1; 45 + ($cpu_freq - 4000) * 15 / 500" | bc -l)
+            elif [ "$cpu_freq" -ge 3500 ]; then
+                # Medium turbo - interpolate between 2.6GHz and 4.0GHz
+                base_power=$(echo "scale=1; 25 + ($cpu_freq - 3500) * 20 / 500" | bc -l)
+            elif [ "$cpu_freq" -ge 2600 ]; then
+                # Base to medium turbo - interpolate between 2.6GHz and 3.5GHz
+                base_power=$(echo "scale=1; 15 + ($cpu_freq - 2600) * 10 / 900" | bc -l)
             else
-                # Throttled mode
-                base_power=3
-                load_factor=$(echo "scale=1; $load_avg * 0.4" | bc -l 2>/dev/null || echo "0")
-                cpu_pkg_power=$(echo "scale=1; $base_power + $load_factor" | bc -l 2>/dev/null || echo "3")
+                # Throttled state - minimum power
+                base_power=$(echo "scale=1; 8 + ($cpu_freq - 800) * 7 / 1800" | bc -l)
+            fi
+
+            # Load factor (CPU utilization impact)
+            # Realistic scaling: 100% load adds ~30-40% to base power
+            if (( $(echo "$load_avg > 8.0" | bc -l 2>/dev/null || echo 0) )); then
+                load_multiplier=1.35    # Very high load
+            elif (( $(echo "$load_avg > 5.0" | bc -l 2>/dev/null || echo 0) )); then
+                load_multiplier=1.25    # High load
+            elif (( $(echo "$load_avg > 2.0" | bc -l 2>/dev/null || echo 0) )); then
+                load_multiplier=1.15    # Medium load
+            else
+                load_multiplier=1.05    # Low load
+            fi
+
+            # Temperature correction factor
+            # Higher temperatures reduce efficiency slightly
+            cpu_temp_int=$(echo "$cpu_temp" | cut -d. -f1 | grep -oE '^[0-9]+' || echo "0")
+            if [ "$cpu_temp_int" -gt 95 ]; then
+                temp_correction=1.15    # Very hot
+            elif [ "$cpu_temp_int" -gt 85 ]; then
+                temp_correction=1.10    # Hot
+            elif [ "$cpu_temp_int" -gt 75 ]; then
+                temp_correction=1.05    # Warm
+            else
+                temp_correction=1.00    # Normal
+            fi
+
+            # Calculate final power
+            cpu_pkg_power=$(echo "scale=1; $base_power * $load_multiplier * $temp_correction" | bc -l)
+
+            # Cap at realistic maximum for i7-9750H
+            if (( $(echo "$cpu_pkg_power > 70" | bc -l 2>/dev/null || echo 0) )); then
+                cpu_pkg_power="70.0"
+            fi
+
+            # Floor at realistic minimum
+            if (( $(echo "$cpu_pkg_power < 5" | bc -l 2>/dev/null || echo 0) )); then
+                cpu_pkg_power="5.0"
             fi
 
             # Memory power estimation based on active memory
