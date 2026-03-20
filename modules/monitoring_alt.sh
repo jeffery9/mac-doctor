@@ -10,11 +10,40 @@ start_thermal_monitor_alt() {
         while [ $EARLY_STOP -eq 0 ] && [ ! -f /tmp/stress_early_stop.flag ]; do
             ts=$(date +%H:%M:%S)
 
-            # Get CPU frequency via sysctl (always available)
+            # Enhanced CPU frequency detection
             cpu_freq=$(sysctl -n hw.cpufrequency 2>/dev/null | awk '{printf "%.0f", $1/1000000}' || echo "0")
-            if [ "$cpu_freq" -eq 0 ]; then
-                # Fallback to nominal frequency
-                cpu_freq=$(sysctl -n hw.cpufrequency_max 2>/dev/null | awk '{printf "%.0f", $1/1000000}' || echo "2600")
+            if [ "$cpu_freq" -eq 0 ] || [ "$cpu_freq" -eq 2600 ]; then
+                # Try to detect actual frequency from system indicators
+                cpu_limit=$(pmset -g therm 2>/dev/null | grep "CPU_Speed_Limit" | awk -F'=' '{print $2}' | tr -d ' ' || echo "100")
+
+                if [ "$cpu_limit" -lt 100 ]; then
+                    # Being throttled - calculate actual frequency
+                    freq=$(echo "scale=0; 2600 * $cpu_limit / 100" | bc -l 2>/dev/null || echo "2600")
+                    cpu_freq=$freq
+                else
+                    # Try to get from ioreg PerformanceStatistics if available
+                    perf_stats=$(ioreg -l 2>/dev/null | grep '"PerformanceStatistics"' | head -1)
+                    if [ -n "$perf_stats" ]; then
+                        # Look for GPU activity as indicator of system load
+                        gpu_act=$(echo "$perf_stats" | grep -oE '"GPU Activity\(%\)"=[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "0")
+                        if [ "$gpu_act" -gt 10 ]; then
+                            # System under load - likely at turbo
+                            cpu_freq=3500
+                        else
+                            # Base frequency
+                            cpu_freq=2600
+                        fi
+                    else
+                        # Use load as indicator
+                        if (( $(echo "$load_avg > 8.0" | bc -l 2>/dev/null || echo 0) )); then
+                            cpu_freq=3500  # Turbo under high load
+                        elif (( $(echo "$load_avg > 4.0" | bc -l 2>/dev/null || echo 0) )); then
+                            cpu_freq=3200  # Above base under medium load
+                        else
+                            cpu_freq=2600  # Base frequency
+                        fi
+                    fi
+                fi
             fi
 
             # Get load average as performance indicator
@@ -32,9 +61,17 @@ start_thermal_monitor_alt() {
                 # Extract GPU activity percentage
                 gpu_act=$(echo "$gpu_line" | grep -oE '"GPU Activity\(%\)"=[0-9]+' | grep -oE '[0-9]+' || echo "0")
 
-                # Extract fan speed
-                fan_pct=$(echo "$gpu_line" | grep -oE '"Fan Speed\(%\)"=[0-9]+' | grep -oE '[0-9]+' || echo "0")
-                fan_rpm=$(echo "$gpu_line" | grep -oE '"Fan Speed\(RPM\)"=[0-9]+' | grep -oE '[0-9]+' || echo "0")
+                # Extract fan speed - look for all PerformanceStatistics entries
+                fan_data=$(ioreg -l 2>/dev/null | grep -A50 '"PerformanceStatistics"' | grep -E "Fan Speed")
+                fan_pct=$(echo "$fan_data" | grep -oE '"Fan Speed\(%\)"=[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "0")
+                fan_rpm=$(echo "$fan_data" | grep -oE '"Fan Speed\(RPM\)"=[0-9]+' | grep -oE '[0-9]+' | head -1 || echo "0")
+
+                # If still 0, try alternative patterns
+                if [ "$fan_rpm" -eq 0 ] && [ "$fan_pct" -eq 0 ]; then
+                    # Some systems report just "Fan Speed" without (%)
+                    fan_rpm=$(ioreg -l 2>/dev/null | grep -i "fan.*rpm" | grep -oE '[0-9]+' | head -1 || echo "0")
+                    fan_pct=$(ioreg -l 2>/dev/null | grep -i "fan.*%" | grep -oE '[0-9]+' | head -1 || echo "0")
+                fi
             else
                 gpu_power="0"
                 gpu_temp="0"
@@ -56,21 +93,61 @@ start_thermal_monitor_alt() {
                 fi
             fi
 
-            # Method 2: Estimate CPU temperature based on frequency and load
-            if [ "$cpu_temp" -eq 0 ]; then
-                if [ "$cpu_freq" -lt 2000 ] && [ "$cpu_freq" -gt 800 ]; then
+            # Method 2: Enhanced temperature estimation based on multiple indicators
+            if [ "$cpu_temp" -eq 0 ] || [ "$cpu_temp" -lt 40 ]; then
+                # More accurate temperature estimation based on system indicators
+
+                # Priority 1: Check CPU throttling indicators
+                if [ "$cpu_freq" -lt 1500 ] && [ "$cpu_freq" -gt 800 ]; then
                     # Frequency throttled, likely due to heat
-                    est_cpu_temp=$((80 + (2600 - cpu_freq) / 50))
+                    est_cpu_temp=90
                 elif [ "$cpu_freq" -le 800 ]; then
-                    # Severe throttling
-                    est_cpu_temp=95
+                    # Severe throttling - critical temperature
+                    est_cpu_temp=100
+                elif [ "$cpu_limit" -lt 90 ]; then
+                    # CPU being throttled = likely hot
+                    limit_int=$(echo "$cpu_limit" | cut -d. -f1)
+                    if [ "$limit_int" -lt 70 ]; then
+                        est_cpu_temp=100  # Severe throttling
+                    elif [ "$limit_int" -lt 85 ]; then
+                        est_cpu_temp=95   # Significant throttling
+                    else
+                        est_cpu_temp=90   # Mild throttling
+                    fi
+
+                # Priority 2: Check fan indicators
+                elif [ "$fan_pct" -gt 70 ] || [ "$fan_rpm" -gt 4000 ]; then
+                    # Fan running at high speed = likely hot
+                    est_cpu_temp=85
+                elif [ "$fan_pct" -gt 50 ] || [ "$fan_rpm" -gt 3000 ]; then
+                    # Fan running medium = warm
+                    est_cpu_temp=75
+
+                # Priority 3: Check load indicators
                 elif (( $(echo "$load_avg > 8.0" | bc -l 2>/dev/null || echo 0) )); then
-                    # High load
-                    est_cpu_temp=$((70 + load_avg))
+                    # High load - use bc for float arithmetic
+                    load_int=$(echo "$load_avg" | cut -d. -f1)
+                    if [ "$load_int" -gt 10 ]; then
+                        est_cpu_temp=95   # Very high load
+                    elif [ "$load_int" -gt 8 ]; then
+                        est_cpu_temp=90   # High load
+                    else
+                        est_cpu_temp=85   # Medium-high load
+                    fi
+
+                # Priority 4: Normal operation with corrections
                 else
-                    # Normal operation
-                    est_cpu_temp=55
+                    # Base temperature with corrections
+                    est_cpu_temp=60
+
+                    # GPU temperature as indicator
+                    if [ "$gpu_temp" -gt 80 ]; then
+                        est_cpu_temp=85  # GPU hot = CPU likely hot too
+                    elif [ "$gpu_temp" -gt 70 ]; then
+                        est_cpu_temp=75  # GPU warm
+                    fi
                 fi
+
                 cpu_temp=$est_cpu_temp
             fi
 
