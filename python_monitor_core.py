@@ -122,15 +122,15 @@ class MacOSMonitor:
             result = subprocess.run(['powermetrics', '--samplers', 'smc', '-n', '1', '-i', '100'],
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                # Look for CPU die temperature in output
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'CPU die temperature:' in line:
-                        # Extract temperature value
-                        parts = line.split(':')
-                        if len(parts) >= 2:
-                            temp_str = parts[1].strip().split()[0]  # Get first number
-                            return float(temp_str)
+                # Use string find instead of line iteration for better performance
+                output = result.stdout
+                start_idx = output.find('CPU die temperature:')
+                if start_idx != -1:
+                    # Extract temperature from the found position
+                    temp_part = output[start_idx + len('CPU die temperature:'):].lstrip()
+                    temp_str = temp_part.split()[0] if temp_part else ""
+                    if temp_str:
+                        return float(temp_str)
         except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, PermissionError):
             pass
 
@@ -155,18 +155,19 @@ class MacOSMonitor:
             cmd = ['ioreg', '-r', '-c', 'IOHWSensor', '-d', '2']
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                # Look for CPU temperature sensor
-                lines = result.stdout.split('\n')
-                for i, line in enumerate(lines):
-                    if '"type" = <temperature>' in line and i + 5 < len(lines):
-                        # Look for temperature value
-                        for j in range(i, min(i+10, len(lines))):
-                            if '"current-value"' in lines[j]:
-                                value = lines[j].split('=')[1].strip()
-                                temp_kelvin = float(value) / 1000000.0
-                                return temp_kelvin - 273.15
+                # Use regex to find CPU temperature more efficiently
+                import re
+                # Pattern to match temperature sensor current-value
+                temp_pattern = r'"type" = <temperature>.*?"current-value" = ([0-9]+)'
+                matches = re.finditer(temp_pattern, result.stdout, re.DOTALL)
+                if matches:
+                    # Return the first temperature found (usually CPU)
+                    for match in matches:
+                        value = int(match.group(1))
+                        temp_kelvin = value / 1000000.0
+                        return temp_kelvin - 273.15
                 return None
-        except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError):
+        except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, re.error):
             pass
         return None
 
@@ -177,15 +178,15 @@ class MacOSMonitor:
             result = subprocess.run(['powermetrics', '--samplers', 'smc', '-n', '1', '-i', '100'],
                                   capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                # Look for GPU die temperature in output
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'GPU die temperature:' in line:
-                        # Extract temperature value
-                        parts = line.split(':')
-                        if len(parts) >= 2:
-                            temp_str = parts[1].strip().split()[0]  # Get first number
-                            return float(temp_str)
+                # Use string find instead of line iteration for better performance
+                output = result.stdout
+                start_idx = output.find('GPU die temperature:')
+                if start_idx != -1:
+                    # Extract temperature from the found position
+                    temp_part = output[start_idx + len('GPU die temperature:'):].lstrip()
+                    temp_str = temp_part.split()[0] if temp_part else ""
+                    if temp_str:
+                        return float(temp_str)
         except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, PermissionError):
             pass
 
@@ -194,21 +195,23 @@ class MacOSMonitor:
             cmd = ['ioreg', '-r', '-c', 'IOHWSensor', '-d', '2']
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                # Look for GPU temperature sensor
-                lines = result.stdout.split('\n')
-                for i, line in enumerate(lines):
-                    if '"type" = <temperature>' in line and i + 5 < len(lines):
-                        # Check if this is GPU sensor
-                        for j in range(i, min(i+10, len(lines))):
-                            if 'GPU' in lines[j] or 'gpu' in lines[j]:
-                                # Look for temperature value
-                                for k in range(j, min(j+5, len(lines))):
-                                    if '"current-value"' in lines[k]:
-                                        value = lines[k].split('=')[1].strip()
-                                        temp_kelvin = float(value) / 1000000.0
-                                        return temp_kelvin - 273.15
+                # Use regex to find GPU temperature sensor more efficiently
+                import re
+                # Pattern to match GPU temperature sensor blocks
+                gpu_temp_pattern = r'"type" = <temperature>.*?"current-value" = ([0-9]+)'
+                # Find all temperature sensors
+                matches = re.finditer(gpu_temp_pattern, result.stdout, re.DOTALL)
+                for match in matches:
+                    # Check if this block contains GPU reference
+                    block_start = max(0, match.start() - 200)  # Look back 200 chars
+                    block_end = min(len(result.stdout), match.end() + 200)  # Look forward 200 chars
+                    block = result.stdout[block_start:block_end]
+                    if 'GPU' in block or 'gpu' in block:
+                        value = int(match.group(1))
+                        temp_kelvin = value / 1000000.0
+                        return temp_kelvin - 273.15
                 return None
-        except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError):
+        except (subprocess.TimeoutExpired, ValueError, subprocess.SubprocessError, re.error):
             pass
         return None
 
