@@ -4,9 +4,9 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # Source required modules
-source "$SCRIPT_DIR/modules/config.sh"
-source "$SCRIPT_DIR/modules/logging.sh"
-source "$SCRIPT_DIR/modules/monitoring.sh"
+source "$SCRIPT_DIR/../modules/config.sh"
+source "$SCRIPT_DIR/../modules/logging.sh"
+source "$SCRIPT_DIR/../modules/monitoring.sh"
 
 # Set up test environment
 REPORT_DIR="/tmp/powermetrics_test_$(date +%Y%m%d_%H%M%S)"

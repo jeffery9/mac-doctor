@@ -13,6 +13,7 @@ source "$SCRIPT_DIR/modules/system_info.sh"
 source "$SCRIPT_DIR/modules/monitoring.sh"
 source "$SCRIPT_DIR/modules/monitoring_nonroot.sh"
 source "$SCRIPT_DIR/modules/monitoring_alt.sh"
+source "$SCRIPT_DIR/modules/monitoring_python.sh"
 source "$SCRIPT_DIR/modules/stress_tests.sh"
 source "$SCRIPT_DIR/modules/analysis.sh"
 source "$SCRIPT_DIR/modules/charting.sh"
@@ -155,7 +156,14 @@ header "2. 启动诊断监控"
 initialize_csv_logs
 
 # Start all monitoring processes based on permissions
-if [ "$EUID" -eq 0 ]; then
+if [ "$PYTHON_MONITOR" = "true" ]; then
+    # Python monitoring mode - works in both root and non-root
+    log "${YELLOW}[提示] Python监控模式${NC}"
+    start_voltage_monitor
+    start_thermal_monitor
+    start_power_monitor
+    start_disk_io_monitor
+elif [ "$EUID" -eq 0 ]; then
     # Root mode - use hybrid monitoring (powermetrics + ioreg backup)
     log "${YELLOW}[提示] Root模式，使用混合监控算法${NC}"
     start_combined_monitoring

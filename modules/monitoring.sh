@@ -4,6 +4,21 @@
 # 监控模块 - 电压、温度、频率、磁盘IO等监控功能
 # ==============================================================================
 
+# Source monitoring modules if available
+MODULES_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+if [[ -f "$MODULES_DIR/monitoring_python.sh" ]]; then
+    source "$MODULES_DIR/monitoring_python.sh"
+fi
+if [[ -f "$MODULES_DIR/powermetrics_python.sh" ]]; then
+    source "$MODULES_DIR/powermetrics_python.sh"
+fi
+if [[ -f "$MODULES_DIR/continuous_powermetrics.sh" ]]; then
+    source "$MODULES_DIR/continuous_powermetrics.sh"
+fi
+if [[ -f "$MODULES_DIR/continuous_monitoring.sh" ]]; then
+    source "$MODULES_DIR/continuous_monitoring.sh"
+fi
+
 # Check powermetrics availability and capabilities
 check_powermetrics() {
     if ! command -v powermetrics >/dev/null 2>&1; then
@@ -20,6 +35,391 @@ check_powermetrics() {
 
     log "${GREEN}[监控] powermetrics 可用，将启用高级监控模式${NC}"
     return 0
+}
+
+# New comprehensive sensor and power data acquisition function using powermetrics
+# This function continuously reads from powermetrics with optimized samplers
+get_sensor_data_powermetrics() {
+    local cpu_temp_var="$1"
+    local gpu_temp_var="$2"
+    local fan_rpm_var="$3"
+    local cpu_freq_var="$4"
+    local c_plimit_var="$5"
+    local c_prochot_var="$6"
+    local c_thermlvl_var="$7"
+
+    # Initialize return values
+    eval "$cpu_temp_var='0'"
+    eval "$gpu_temp_var='0'"
+    eval "$fan_rpm_var='0'"
+    eval "$cpu_freq_var='0'"
+    eval "$c_plimit_var='0.00'"
+    eval "$c_prochot_var='0'"
+    eval "$c_thermlvl_var='0'"
+
+    # Use temporary file for powermetrics output
+    local PM_TMP_FILE="/tmp/pm_smc_out_$$"
+    local pm_out=""
+    local success=0
+
+    # Try multiple approaches to get SMC data
+    # Approach 1: Use smc,cpu_power,gpu_power samplers
+    {
+        powermetrics -n 1 -i 300 --samplers smc,cpu_power,gpu_power 2>/dev/null > "$PM_TMP_FILE"
+    } &
+    local PM_PID=$!
+
+    # Wait for completion with shorter timeout for continuous operation
+    local sleep_count=0
+    while kill -0 $PM_PID 2>/dev/null && [ $sleep_count -lt 4 ]; do
+        sleep 1
+        sleep_count=$((sleep_count + 1))
+    done
+
+    if [ $sleep_count -lt 4 ]; then
+        # Process completed successfully
+        wait $PM_PID 2>/dev/null
+        pm_out=$(cat "$PM_TMP_FILE" 2>/dev/null)
+        if [ -n "$pm_out" ]; then
+            success=1
+        fi
+    else
+        # Timeout - kill the process
+        kill -9 $PM_PID 2>/dev/null || true
+    fi
+
+    # Approach 2: If first approach failed or didn't return SMC data, try just smc
+    if [ $success -eq 0 ] || ! echo "$pm_out" | grep -q "SMC sensors"; then
+        {
+            powermetrics -n 1 -i 300 --samplers smc 2>/dev/null > "$PM_TMP_FILE"
+        } &
+        local PM_PID2=$!
+
+        local sleep_count2=0
+        while kill -0 $PM_PID2 2>/dev/null && [ $sleep_count2 -lt 4 ]; do
+            sleep 1
+            sleep_count2=$((sleep_count2 + 1))
+        done
+
+        if [ $sleep_count2 -lt 4 ]; then
+            wait $PM_PID2 2>/dev/null
+            local pm_out2=$(cat "$PM_TMP_FILE" 2>/dev/null)
+            if [ -n "$pm_out2" ]; then
+                pm_out="$pm_out2"
+                success=1
+            fi
+        else
+            kill -9 $PM_PID2 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$PM_TMP_FILE"
+
+    # Parse SMC sensor data from powermetrics output
+    if [ $success -eq 1 ] && [ -n "$pm_out" ]; then
+        # Debug: log the raw output for troubleshooting
+        # echo "[DEBUG] Powermetrics output: $pm_out" >&2
+
+        # Extract CPU die temperature - multiple pattern attempts
+        local cpu_temp=""
+        # Try direct pattern first
+        cpu_temp=$(echo "$pm_out" | awk '/CPU die temperature:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+$/) {
+                    print int($i);
+                    exit;
+                }
+            }
+        }')
+
+        # If that fails, try extracting any number after "CPU die temperature"
+        if [ -z "$cpu_temp" ] || [ "$cpu_temp" = "0" ]; then
+            cpu_temp=$(echo "$pm_out" | sed -n 's/.*CPU die temperature:[^0-9]*\([0-9.]*\).*/\1/p' | head -1 | cut -d. -f1)
+        fi
+
+        if [ -n "$cpu_temp" ] && echo "$cpu_temp" | grep -qE '^[0-9]+$' && [ "$cpu_temp" -ge 0 ] && [ "$cpu_temp" -le 120 ]; then
+            eval "$cpu_temp_var='$cpu_temp'"
+        else
+            eval "$cpu_temp_var='0'"
+        fi
+
+        # Extract GPU die temperature
+        local gpu_temp=""
+        gpu_temp=$(echo "$pm_out" | awk '/GPU die temperature:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+$/) {
+                    print int($i);
+                    exit;
+                }
+            }
+        }')
+
+        if [ -z "$gpu_temp" ] || [ "$gpu_temp" = "0" ]; then
+            gpu_temp=$(echo "$pm_out" | sed -n 's/.*GPU die temperature:[^0-9]*\([0-9.]*\).*/\1/p' | head -1 | cut -d. -f1)
+        fi
+
+        if [ -n "$gpu_temp" ] && echo "$gpu_temp" | grep -qE '^[0-9]+$' && [ "$gpu_temp" -ge 0 ] && [ "$gpu_temp" -le 120 ]; then
+            eval "$gpu_temp_var='$gpu_temp'"
+        else
+            eval "$gpu_temp_var='0'"
+        fi
+
+        # Extract fan RPM - handle "Fan: XXXX.XX rpm" format
+        local fan_rpm=""
+        fan_rpm=$(echo "$pm_out" | awk '/Fan:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+$/) {
+                    print int($i);
+                    exit;
+                }
+            }
+        }')
+
+        if [ -z "$fan_rpm" ] || [ "$fan_rpm" = "0" ]; then
+            fan_rpm=$(echo "$pm_out" | sed -n 's/.*Fan:[^0-9]*\([0-9.]*\).*/\1/p' | head -1 | cut -d. -f1)
+        fi
+
+        if [ -n "$fan_rpm" ] && [ "$fan_rpm" -ge 0 ] && [ "$fan_rpm" -le 10000 ]; then
+            eval "$fan_rpm_var='$fan_rpm'"
+        else
+            eval "$fan_rpm_var='0'"
+        fi
+
+        # Extract CPU Plimit
+        local c_pl=""
+        c_pl=$(echo "$pm_out" | awk '/CPU Plimit:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+$/) {
+                    print $i;
+                    exit;
+                }
+            }
+        }')
+
+        if [ -z "$c_pl" ]; then
+            c_pl=$(echo "$pm_out" | sed -n 's/.*CPU Plimit:[^0-9.]*\([0-9.]*\).*/\1/p' | head -1)
+        fi
+
+        if [ -n "$c_pl" ] && echo "$c_pl" | grep -qE '^[0-9.]+$'; then
+            eval "$c_plimit_var='$c_pl'"
+        else
+            eval "$c_plimit_var='0.00'"
+        fi
+
+        # Extract prochots count
+        local c_pr=""
+        c_pr=$(echo "$pm_out" | awk '/Number of prochots:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9]+$/) {
+                    print $i;
+                    exit;
+                }
+            }
+        }')
+
+        if [ -z "$c_pr" ]; then
+            c_pr=$(echo "$pm_out" | sed -n 's/.*Number of prochots:[^0-9]*\([0-9]*\).*/\1/p' | head -1)
+        fi
+
+        if [ -n "$c_pr" ] && echo "$c_pr" | grep -qE '^[0-9]+$'; then
+            eval "$c_prochot_var='$c_pr'"
+        else
+            eval "$c_prochot_var='0'"
+        fi
+
+        # Extract thermal level
+        local c_tl=""
+        c_tl=$(echo "$pm_out" | awk '/CPU Thermal level:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9]+$/) {
+                    print $i;
+                    exit;
+                }
+            }
+        }')
+
+        if [ -z "$c_tl" ]; then
+            c_tl=$(echo "$pm_out" | sed -n 's/.*CPU Thermal level:[^0-9]*\([0-9]*\).*/\1/p' | head -1)
+        fi
+
+        if [ -n "$c_tl" ] && echo "$c_tl" | grep -qE '^[0-9]+$'; then
+            eval "$c_thermlvl_var='$c_tl'"
+        else
+            eval "$c_thermlvl_var='0'"
+        fi
+
+        # Extract CPU frequency if available in output
+        local c_freq=""
+        c_freq=$(echo "$pm_out" | awk '/CPU [0-9]* average frequency/ {sum+=$5; count++} END {if(count>0) print int(sum/count)}')
+        if [ -z "$c_freq" ] || ! echo "$c_freq" | grep -qE '^[0-9]+$' || [ "$c_freq" -eq 0 ]; then
+            # Try alternative pattern for Apple Silicon
+            c_freq=$(echo "$pm_out" | awk '/E cluster.*frequency/ {print $4; exit}' | sed 's/MHz//')
+        fi
+        # Validate frequency range
+        if [ -n "$c_freq" ] && echo "$c_freq" | grep -qE '^[0-9]+$' && [ "$c_freq" -ge 400 ] && [ "$c_freq" -le 6000 ]; then
+            eval "$cpu_freq_var='$c_freq'"
+        else
+            # Last resort: sysctl
+            local cpu_freq_sysctl=$(sysctl -n hw.cpufrequency 2>/dev/null | awk '{printf "%.0f", $1/1000000}' || echo "0")
+            if [ "$cpu_freq_sysctl" -ge 400 ] && [ "$cpu_freq_sysctl" -le 6000 ]; then
+                eval "$cpu_freq_var='$cpu_freq_sysctl'"
+            else
+                eval "$cpu_freq_var='800'"
+            fi
+        fi
+
+        return 0
+    fi
+
+    return 1
+}
+
+# Power data acquisition function using powermetrics
+# This function extracts CPU and GPU power data
+get_power_data_powermetrics() {
+    local cpu_power_var="$1"
+    local gpu_power_var="$2"
+    local mem_power_var="$3"
+
+    # Initialize return values
+    eval "$cpu_power_var='N/A'"
+    eval "$gpu_power_var='N/A'"
+    eval "$mem_power_var='N/A'"
+
+    # Use temporary file for powermetrics output
+    local PM_POWER_TMP="/tmp/pm_power_out_$$"
+    local pm_power_out=""
+    local success=0
+
+    # Run powermetrics with power samplers
+    {
+        powermetrics -n 1 -i 300 --samplers cpu_power,gpu_power 2>/dev/null > "$PM_POWER_TMP"
+    } &
+    local PM_POWER_PID=$!
+
+    # Wait for completion with timeout
+    local sleep_count=0
+    while kill -0 $PM_POWER_PID 2>/dev/null && [ $sleep_count -lt 4 ]; do
+        sleep 1
+        sleep_count=$((sleep_count + 1))
+    done
+
+    if [ $sleep_count -lt 4 ]; then
+        # Process completed successfully
+        wait $PM_POWER_PID 2>/dev/null
+        pm_power_out=$(cat "$PM_POWER_TMP" 2>/dev/null)
+        if [ -n "$pm_power_out" ]; then
+            success=1
+        fi
+    else
+        # Timeout - kill the process
+        kill -9 $PM_POWER_PID 2>/dev/null || true
+    fi
+    rm -f "$PM_POWER_TMP"
+
+    # Parse power data from powermetrics output
+    if [ $success -eq 1 ] && [ -n "$pm_power_out" ]; then
+        # CPU package power - more robust extraction
+        local cpu_pkg_power=$(echo "$pm_power_out" | awk '
+        /CPU Power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }
+        /Package Power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }
+        /CPU package power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }' | head -1)
+
+        # GPU package power
+        local gpu_pkg_power=$(echo "$pm_power_out" | awk '
+        /GPU Power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }
+        /GPU package power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }' | head -1)
+
+        # Memory power
+        local mem_power=$(echo "$pm_power_out" | awk '
+        /Memory Power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }
+        /DRAM Power:/ {
+            for(i=1; i<=NF; i++) {
+                if($i ~ /^[0-9.]+W$/) {
+                    gsub(/W/, "", $i);
+                    print $i;
+                    exit;
+                }
+            }
+        }' | head -1)
+
+        # Validate and assign values
+        if [ -n "$cpu_pkg_power" ] && echo "$cpu_pkg_power" | grep -qE '^[0-9.]+$'; then
+            # Cap at 150W for Intel mobile CPUs
+            if (( $(echo "$cpu_pkg_power > 150" | bc -l 2>/dev/null || echo 0) )); then
+                cpu_pkg_power="150.0"
+            fi
+            eval "$cpu_power_var='$cpu_pkg_power'"
+        fi
+
+        if [ -n "$gpu_pkg_power" ] && echo "$gpu_pkg_power" | grep -qE '^[0-9.]+$'; then
+            # Cap at 100W for mobile GPUs
+            if (( $(echo "$gpu_pkg_power > 100" | bc -l 2>/dev/null || echo 0) )); then
+                gpu_pkg_power="100.0"
+            fi
+            eval "$gpu_power_var='$gpu_pkg_power'"
+        fi
+
+        if [ -n "$mem_power" ] && echo "$mem_power" | grep -qE '^[0-9.]+$'; then
+            # Cap at 25W for memory
+            if (( $(echo "$mem_power > 25" | bc -l 2>/dev/null || echo 0) )); then
+                mem_power="25.0"
+            fi
+            eval "$mem_power_var='$mem_power'"
+        fi
+
+        return 0
+    fi
+
+    return 1
 }
 
 # Initialize CSV logs
@@ -47,8 +447,80 @@ start_voltage_monitor() {
     log "${GREEN}[监控] 电压记录已启动${NC}"
 }
 
-# Combined Thermal & Throttling monitor
+# Wrapper function to start power monitoring with mode selection
+start_power_monitor() {
+    if [[ "$PYTHON_MONITOR" == "true" ]] && check_python_monitor_available; then
+        log "${GREEN}[监控] 使用Python功率监控模式${NC}"
+        if start_power_monitor_python "$@"; then
+            return 0
+        else
+            log "${YELLOW}[监控] Python功率监控启动失败，回退到Shell监控${NC}"
+            PYTHON_MONITOR=false
+        fi
+    fi
+
+    # Fall back to shell monitoring
+    start_power_monitor_shell "$@"
+}
+
+# Power consumption monitor (Shell version)
+start_power_monitor_shell() {
+    (
+        while [ $EARLY_STOP -eq 0 ] && [ ! -f /tmp/stress_early_stop.flag ]; do
+            ts=$(date +%H:%M:%S)
+
+            if [ "$EUID" -eq 0 ]; then
+                # Use powermetrics for comprehensive power monitoring
+                cpu_pkg_power="N/A"
+                gpu_pkg_power="N/A"
+                mem_power="N/A"
+
+                # Use new power data acquisition function
+                if get_power_data_powermetrics cpu_pkg_power gpu_pkg_power mem_power; then
+                    log "${GREEN}[监控] 功率数据采集成功 (powermetrics)${NC}" >&2
+                else
+                    log "${YELLOW}[监控] 功率数据采集失败${NC}" >&2
+                fi
+            else
+                # Non-root fallback - use ioreg for basic power estimation
+                # This is less accurate but doesn't require sudo
+                cpu_pkg_power="N/A"
+                gpu_pkg_power="N/A"
+                mem_power="N/A"
+            fi
+
+            # Log power data
+            echo "$ts,$cpu_pkg_power,$gpu_pkg_power,$mem_power" >> "$POWER_LOG"
+
+            # Display power info in log
+            if [ "$cpu_pkg_power" != "N/A" ]; then
+                log "${GREEN}[监控] 估算功耗 - CPU: ${cpu_pkg_power}W, GPU: ${gpu_pkg_power}W${NC}" >&2
+            fi
+
+            sleep $SAMPLE_INTERVAL
+        done
+    ) & POWER_PID=$!
+    log "${GREEN}[监控] 功耗记录已启动${NC}"
+}
+
+# Wrapper function to start thermal monitoring with mode selection
 start_thermal_monitor() {
+    if [[ "$PYTHON_MONITOR" == "true" ]] && check_python_monitor_available; then
+        log "${GREEN}[监控] 使用Python监控模式${NC}"
+        if start_thermal_monitor_python "$@"; then
+            return 0
+        else
+            log "${YELLOW}[监控] Python监控启动失败，回退到Shell监控${NC}"
+            PYTHON_MONITOR=false
+        fi
+    fi
+
+    # Fall back to shell monitoring
+    start_thermal_monitor_shell "$@"
+}
+
+# Combined Thermal & Throttling monitor (Shell version)
+start_thermal_monitor_shell() {
     (
         while [ $EARLY_STOP -eq 0 ] && [ ! -f /tmp/stress_early_stop.flag ]; do
             ts=$(date +%H:%M:%S)
@@ -91,144 +563,38 @@ start_thermal_monitor() {
             c_thermlvl="0"
 
             if [ "$EUID" -eq 0 ]; then
-                # Enhanced powermetrics strategy for comprehensive monitoring
-                # Use background process with controlled execution time
-                PM_TMP_FILE="/tmp/pm_out_$$"
-
-                # Run powermetrics with comprehensive samplers for Intel and Apple Silicon
-                # Include: cpu, gpu, thermal, smc, power, memory, disk for complete monitoring
-                # -n 1 -i 1000: single sample with 1s interval for stable readings
-                # Use background execution with sleep to prevent hanging
-                # Optimized sampler selection for high-load scenarios
-                {
-                    powermetrics -n 1 -i 500 --samplers smc,cpu_power,gpu_power,thermal 2>/dev/null > "$PM_TMP_FILE"
-                } &
-                PM_PID=$!
-
-                # Wait for completion with a manual timeout using sleep
-                sleep_count=0
-                while kill -0 $PM_PID 2>/dev/null && [ $sleep_count -lt 8 ]; do
-                    sleep 1
-                    sleep_count=$((sleep_count + 1))
-                done
-
-                if [ $sleep_count -lt 8 ]; then
-                    # Process completed successfully
-                    wait $PM_PID 2>/dev/null
-                    pm_out=$(cat "$PM_TMP_FILE" 2>/dev/null)
-                    if [ -n "$pm_out" ]; then
-                        log "${GREEN}[监控] powermetrics 数据采集成功${NC}" >&2
-                    else
-                        log "${YELLOW}[监控] powermetrics 返回空数据${NC}" >&2
-                    fi
+                # Use new simplified powermetrics sensor data acquisition
+                if get_sensor_data_powermetrics cpu_temp gpu_temp fan_rpm cpu_freq c_plimit c_prochot c_thermlvl; then
+                    log "${GREEN}[监控] SMC传感器数据采集成功 (powermetrics)${NC}" >&2
+                    # Debug output
+                    # log "[DEBUG] CPU Temp: $cpu_temp, GPU Temp: $gpu_temp, Fan: $fan_rpm" >&2
                 else
-                    # Timeout - kill the process
-                    kill -9 $PM_PID 2>/dev/null || true
-                    pm_out=""
-                    log "${YELLOW}[监控] powermetrics 超时，使用回退方法${NC}" >&2
-                fi
-                rm -f "$PM_TMP_FILE"
-
-                # Enhanced parsing with comprehensive pattern matching for all samplers
-                if [ -n "$pm_out" ]; then
-                    # CPU temperature - multiple patterns for different macOS versions and chip types
-                    c_tmp=$(echo "$pm_out" | awk '/CPU die temperature/ {print $4; exit}' | cut -d. -f1)
-                    if [ -z "$c_tmp" ] || ! echo "$c_tmp" | grep -qE '^[0-9]+$'; then
-                        c_tmp=$(echo "$pm_out" | awk '/CPU Temperature:/ {print $3; exit}' | cut -d. -f1)
-                    fi
-                    if [ -z "$c_tmp" ] || ! echo "$c_tmp" | grep -qE '^[0-9]+$'; then
-                        # Apple Silicon pattern
-                        c_tmp=$(echo "$pm_out" | awk '/CPU die temperature:/ {print $4; exit}' | cut -d. -f1)
-                    fi
-                    if [ -n "$c_tmp" ] && echo "$c_tmp" | grep -qE '^[0-9]+$' && [ "$c_tmp" -ge 0 ] && [ "$c_tmp" -le 120 ]; then
-                        cpu_temp="$c_tmp"
-                    fi
-
-                    # Fan RPM - try multiple sources
-                    fan_rpm=$(echo "$pm_out" | awk '/Fan.*RPM/ {print $2; exit}' | head -1)
-                    if [ -z "$fan_rpm" ] || ! echo "$fan_rpm" | grep -qE '^[0-9]+$'; then
-                        fan_rpm=$(echo "$pm_out" | awk '/Fan.*speed/ {print $3; exit}' | head -1)
-                    fi
-                    if [ -z "$fan_rpm" ] || ! echo "$fan_rpm" | grep -qE '^[0-9]+$'; then
-                        # Fallback to ioreg if powermetrics doesn't have fan data
-                        fan_rpm=$(ioreg -l 2>/dev/null | grep -i '"Fan"' | grep -oE '[0-9]+' | head -1)
-                    fi
-
-                    # Enhanced frequency parsing with comprehensive patterns
-                    c_freq=""
-                    # Method 1: Average frequency across all cores (Intel)
-                    c_freq=$(echo "$pm_out" | awk '/CPU [0-9]* average frequency/ {sum+=$5; count++} END {if(count>0) print int(sum/count)}')
-                    if [ -z "$c_freq" ] || ! echo "$c_freq" | grep -qE '^[0-9]+$' || [ "$c_freq" -eq 0 ]; then
-                        # Method 2: Overall CPU average frequency
-                        c_freq=$(echo "$pm_out" | awk '/CPU average frequency/ {gsub(/MHz/, "", $4); print $4; exit}')
-                    fi
-                    if [ -z "$c_freq" ] || ! echo "$c_freq" | grep -qE '^[0-9]+$' || [ "$c_freq" -eq 0 ]; then
-                        # Method 3: Individual core frequencies
-                        c_freq=$(echo "$pm_out" | awk '/CPU[0-9]+:/ && /frequency/ {gsub(/MHz/, "", $NF); if($NF ~ /^[0-9]+$/) sum+=$NF; count++} END {if(count>0) print int(sum/count)}')
-                    fi
-                    if [ -z "$c_freq" ] || ! echo "$c_freq" | grep -qE '^[0-9]+$' || [ "$c_freq" -eq 0 ]; then
-                        # Method 4: Apple Silicon pattern
-                        c_freq=$(echo "$pm_out" | awk '/E cluster.*frequency/ {print $4; exit}' | sed 's/MHz//')
-                    fi
-                    # Validate frequency range
-                    if [ -n "$c_freq" ] && echo "$c_freq" | grep -qE '^[0-9]+$' && [ "$c_freq" -ge 400 ] && [ "$c_freq" -le 6000 ]; then
-                        cpu_freq="$c_freq"
-                    else
-                        # Last resort: sysctl
-                        cpu_freq_sysctl=$(sysctl -n hw.cpufrequency 2>/dev/null | awk '{printf "%.0f", $1/1000000}' || echo "0")
-                        if [ "$cpu_freq_sysctl" -ge 400 ] && [ "$cpu_freq_sysctl" -le 6000 ]; then
-                            cpu_freq="$cpu_freq_sysctl"
-                        else
-                            cpu_freq="800"
-                        fi
-                    fi
-
-                    # Enhanced Plimit parsing
-                    c_pl=$(echo "$pm_out" | awk '/CPU Plimit:/ {gsub(/%/, "", $3); print $3; exit}')
-                    if [ -z "$c_pl" ] || ! echo "$c_pl" | grep -qE '^[0-9.]+$'; then
-                        # Try alternative pattern
-                        c_pl=$(echo "$pm_out" | awk '/Power limit/ {print $3; exit}' | sed 's/%//')
-                    fi
-                    if [ -n "$c_pl" ] && echo "$c_pl" | grep -qE '^[0-9.]+$'; then
-                        c_plimit="$c_pl"
-                    fi
-
-                    # Prochot parsing
-                    c_pr=$(echo "$pm_out" | awk '/Number of prochots:/ {print $4; exit}')
-                    if [ -n "$c_pr" ] && echo "$c_pr" | grep -qE '^[0-9]+$'; then
-                        c_prochot="$c_pr"
-                    fi
-
-                    # Thermal level parsing
-                    c_tl=$(echo "$pm_out" | awk '/CPU Thermal level:/ {print $4; exit}')
-                    if [ -z "$c_tl" ] || ! echo "$c_tl" | grep -qE '^[0-9]+$'; then
-                        # Try alternative pattern
-                        c_tl=$(echo "$pm_out" | awk '/Thermal level/ {print $3; exit}')
-                    fi
-                    if [ -n "$c_tl" ] && echo "$c_tl" | grep -qE '^[0-9]+$'; then
-                        c_thermlvl="$c_tl"
-                    fi
-                else
-                    # If powermetrics failed or returned empty, use fallback methods
-                    log "${YELLOW}[监控] powermetrics 无响应，使用回退方法${NC}" >&2
-                fi
-                
-                # Additional data from comprehensive powermetrics
-                if [ -n "$pm_out" ]; then
-                    # Memory thermal info (if available)
-                    mem_thermal=$(echo "$pm_out" | awk '/Memory thermal level:/ {print $4; exit}')
-                    if [ -n "$mem_thermal" ] && echo "$mem_thermal" | grep -qE '^[0-9]+$'; then
-                        # Could log memory thermal level if needed
-                        :
-                    fi
+                    log "${YELLOW}[监控] SMC传感器数据采集失败，使用回退方法${NC}" >&2
                 fi
 
                 # Fallback: Get SMC data directly from ioreg (more reliable during stress)
-                if [ "$cpu_temp" = "0" ] || [ -z "$cpu_temp" ]; then
+                if [ "$cpu_temp" = "0" ] || [ -z "$cpu_temp" ] || [ "$cpu_temp" = "N/A" ]; then
+                    # Try multiple ioreg approaches for CPU temperature
                     cpu_temp=$(ioreg -l 2>/dev/null | grep -i '"Temperature"' | grep -oE '[0-9]+' | head -1)
+                    if [ -z "$cpu_temp" ] || [ "$cpu_temp" = "0" ]; then
+                        cpu_temp=$(ioreg -l 2>/dev/null | grep -i "TC0P" | grep -oE '[0-9]+' | head -1)
+                    fi
+                    if [ -z "$cpu_temp" ] || [ "$cpu_temp" = "0" ]; then
+                        cpu_temp=$(ioreg -l 2>/dev/null | grep -i "TC0D" | grep -oE '[0-9]+' | head -1)
+                    fi
+                    if [ -z "$cpu_temp" ] || [ "$cpu_temp" = "0" ]; then
+                        cpu_temp=$(ioreg -l 2>/dev/null | grep -i "TCSA" | grep -oE '[0-9]+' | head -1)
+                    fi
                 fi
-                if [ "$fan_rpm" = "0" ] || [ -z "$fan_rpm" ]; then
+                if [ "$fan_rpm" = "0" ] || [ -z "$fan_rpm" ] || [ "$fan_rpm" = "N/A" ]; then
+                    # Try multiple ioreg approaches for fan speed
                     fan_rpm=$(ioreg -l 2>/dev/null | grep -i '"Fan"' | grep -oE '[0-9]+' | head -1)
+                    if [ -z "$fan_rpm" ] || [ "$fan_rpm" = "0" ]; then
+                        fan_rpm=$(ioreg -l 2>/dev/null | grep -i "F0Ac" | grep -oE '[0-9]+' | head -1)
+                    fi
+                    if [ -z "$fan_rpm" ] || [ "$fan_rpm" = "0" ]; then
+                        fan_rpm=$(ioreg -l 2>/dev/null | grep -i "F0Tg" | grep -oE '[0-9]+' | head -1)
+                    fi
                 fi
                 # Validate fallback values
                 if ! echo "$cpu_temp" | grep -qE '^[0-9]+$' || [ "$cpu_temp" -lt 0 ] || [ "$cpu_temp" -gt 120 ]; then cpu_temp="0"; fi
@@ -259,130 +625,6 @@ start_thermal_monitor() {
     log "${GREEN}[监控] 核心频率与热节流监控已启动${NC}"
 }
 
-# Enhanced Power monitor using powermetrics with high-load optimization
-start_power_monitor() {
-    (
-        # High-load optimized power monitoring
-        HIGH_LOAD_MODE=0
-        RETRY_COUNT=0
-        MAX_RETRIES=3
-
-        while [ $EARLY_STOP -eq 0 ] && [ ! -f /tmp/stress_early_stop.flag ]; do
-            ts=$(date +%H:%M:%S)
-
-            if [ "$EUID" -eq 0 ]; then
-                # Use powermetrics for comprehensive power monitoring
-                PM_POWER_TMP="/tmp/pm_power_$$"
-                cpu_pkg_power="N/A"
-                gpu_pkg_power="N/A"
-                mem_power="N/A"
-
-                # Adjust timeout based on system load
-                load_avg=$(uptime | awk -F'load averages:' '{print $2}' | awk '{print $1}' | sed 's/,//')
-                if (( $(echo "$load_avg > 2.0" | bc -l 2>/dev/null || echo 0) )); then
-                    HIGH_LOAD_MODE=1
-                    timeout_val=10  # Longer timeout for high load
-                    sample_duration=1000  # Shorter sample duration
-                else
-                    HIGH_LOAD_MODE=0
-                    timeout_val=6
-                    sample_duration=500
-                fi
-
-                # Retry mechanism for high-load scenarios
-                for retry in $(seq 1 $MAX_RETRIES); do
-                    # Run powermetrics for power data with comprehensive samplers
-                    {
-                        powermetrics -n 1 -i $sample_duration --samplers smc 2>/dev/null > "$PM_POWER_TMP"
-                    } &
-                    PM_POWER_PID=$!
-
-                    # Wait for completion with dynamic timeout
-                    sleep_count=0
-                    while kill -0 $PM_POWER_PID 2>/dev/null && [ $sleep_count -lt $timeout_val ]; do
-                        sleep 1
-                        sleep_count=$((sleep_count + 1))
-                    done
-
-                    if [ $sleep_count -lt $timeout_val ]; then
-                        # Process completed successfully
-                        wait $PM_POWER_PID 2>/dev/null
-                        pm_power_out=$(cat "$PM_POWER_TMP" 2>/dev/null)
-
-                        if [ -n "$pm_power_out" ] && echo "$pm_power_out" | grep -q "Power"; then
-                            log "${GREEN}[监控] powermetrics 功耗数据采集成功 (尝试 $retry)${NC}" >&2
-                            RETRY_COUNT=0
-                            break
-                        else
-                            log "${YELLOW}[监控] powermetrics 数据不完整，重试中 ($retry/$MAX_RETRIES)${NC}" >&2
-                            RETRY_COUNT=$retry
-                        fi
-                    else
-                        # Timeout - kill the process
-                        kill -9 $PM_POWER_PID 2>/dev/null || true
-                        log "${YELLOW}[监控] powermetrics 超时，重试中 ($retry/$MAX_RETRIES)${NC}" >&2
-                        RETRY_COUNT=$retry
-                    fi
-
-                    # Brief pause between retries
-                    if [ $retry -lt $MAX_RETRIES ]; then
-                        sleep 2
-                    fi
-                done
-
-                # Parse power data even if partial
-                if [ -n "$pm_power_out" ]; then
-                    # Parse CPU package power (multiple patterns)
-                    cpu_pkg_power=$(echo "$pm_power_out" | grep -E "CPU.*Power|Package Power" | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /[0-9.]+W/) print $i}' | sed 's/W//' | head -1)
-                    if [ -z "$cpu_pkg_power" ] || ! echo "$cpu_pkg_power" | grep -qE '^[0-9.]+$'; then
-                        # Fallback: try extracting any power value
-                        cpu_pkg_power=$(echo "$pm_power_out" | grep -oE '[0-9.]+W' | head -1 | sed 's/W//')
-                    fi
-
-                    # Parse GPU power
-                    gpu_pkg_power=$(echo "$pm_power_out" | awk '/GPU Power/ {for(i=1;i<=NF;i++) if($i ~ /[0-9.]+W/) print $i; exit}' | sed 's/W//' | head -1)
-                    if [ -z "$gpu_pkg_power" ] || ! echo "$gpu_pkg_power" | grep -qE '^[0-9.]+$'; then
-                        # Try ioreg for GPU power as primary source (more reliable)
-                        gpu_line=$(ioreg -l 2>/dev/null | grep '"PerformanceStatistics"' | grep -i "total power" | head -1)
-                        gpu_pkg_power=$(echo "$gpu_line" | grep -o 'Total Power(W)=[0-9]*' | grep -oE '[0-9]+')
-                    fi
-
-                    # Parse Memory power
-                    mem_power=$(echo "$pm_power_out" | awk '/Memory Power/ {for(i=1;i<=NF;i++) if($i ~ /[0-9.]+W/) print $i; exit}' | sed 's/W//' | head -1)
-                    if [ -z "$mem_power" ] || ! echo "$mem_power" | grep -qE '^[0-9.]+$'; then
-                        mem_power="N/A"
-                    fi
-
-                    # Validate parsed values
-                    if [ -n "$cpu_pkg_power" ] && echo "$cpu_pkg_power" | grep -qE '^[0-9.]+$'; then
-                        log "${GREEN}[监控] CPU功耗: ${cpu_pkg_power}W${NC}" >&2
-                    else
-                        cpu_pkg_power="N/A"
-                    fi
-
-                    if [ -n "$gpu_pkg_power" ] && echo "$gpu_pkg_power" | grep -qE '^[0-9.]+$'; then
-                        log "${GREEN}[监控] GPU功耗: ${gpu_pkg_power}W${NC}" >&2
-                    else
-                        gpu_pkg_power="N/A"
-                    fi
-                else
-                    log "${RED}[监控] 无法获取功耗数据${NC}" >&2
-                fi
-                rm -f "$PM_POWER_TMP"
-            else
-                # Non-root fallback: use ioreg for GPU power only
-                gpu_line=$(ioreg -l 2>/dev/null | grep '"PerformanceStatistics"' | grep -i "total power" | head -1)
-                gpu_pkg_power=$(echo "$gpu_line" | grep -o 'Total Power(W)=[0-9]*' | grep -oE '[0-9]+' || echo "N/A")
-                [ -z "$gpu_pkg_power" ] && gpu_pkg_power="N/A"
-                cpu_pkg_power="N/A"
-                mem_power="N/A"
-            fi
-
-            echo "$ts,$cpu_pkg_power,$gpu_pkg_power,$mem_power" >> "$POWER_LOG"
-            sleep $SAMPLE_INTERVAL
-        done
-    ) & POWER_PID=$!
-}
 
 # Disk IO monitor
 start_disk_io_monitor() {

@@ -35,16 +35,16 @@ print("Starting GPU stress loop...")
 while true {
     guard let commandBuffer = commandQueue.makeCommandBuffer(),
           let encoder = commandBuffer.makeComputeCommandEncoder() else { break }
-    
+
     encoder.setComputePipelineState(pipelineState)
     encoder.setBuffer(buffer, offset: 0, index: 0)
-    
+
     let gridSize = MTLSizeMake(elementCount, 1, 1)
     let threadGroupSize = MTLSizeMake(pipelineState.maxTotalThreadsPerThreadgroup, 1, 1)
-    
+
     encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
     encoder.endEncoding()
-    
+
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
 }
