@@ -21,6 +21,7 @@ TEST_COMPLETED=0
 EARLY_STOP=0
 TEST_MODE=""
 CURRENT_PHASE=""
+PYTHON_MONITOR=true
 
 # Parse command line arguments
 parse_arguments() {
@@ -46,6 +47,14 @@ parse_arguments() {
             -v|--voltage-threshold)
                 VOLTAGE_DROP_THRESHOLD="$2"
                 shift 2
+                ;;
+            --python-monitor)
+                PYTHON_MONITOR=true
+                shift
+                ;;
+            --shell-monitor)
+                PYTHON_MONITOR=false
+                shift
                 ;;
             *)
                 echo "Unknown option: $1"
